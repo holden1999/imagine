@@ -1,14 +1,13 @@
 import os
 from pathlib import Path
 from typing import Optional, Dict, Any
-import coremltools as ct
 import numpy as np
 import chromadb
-from PIL import Image
 import logging
-import uuid
 from dotenv import load_dotenv
 import time
+from ultralytics import YOLO
+from sentence_transformers import SentenceTransformer
 
 # Load environment variables
 load_dotenv()
@@ -20,18 +19,15 @@ logger = logging.getLogger(__name__)
 
 class MediaIndexer:
     def __init__(self, model_path: str):
-        """Initialize the indexer with CoreML model and ChromaDB"""
+        """Initialize the indexer with YOLO model, SentenceTransformer and ChromaDB"""
         try:
-            self.model = ct.models.MLModel(model_path)
+            # Initialize YOLO
+            self.model = YOLO(model_path)
+            logger.info("YOLO model loaded successfully")
 
-            # Get the spec from the MLModel
-            spec = self.model.get_spec()
-
-            # Print the input/output description for the MLModel
-            # print(spec.description)
-
-            # Get the type of MLModel (NeuralNetwork, SupportVectorRegressor, Pipeline etc)
-            print(spec.WhichOneof('Type'))
+            # Initialize SentenceTransformer
+            self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+            logger.info("SentenceTransformer loaded successfully")
 
             # Initialize ChromaDB
             self.chroma_client = chromadb.HttpClient()
@@ -58,32 +54,9 @@ class MediaIndexer:
             logger.error(f"Initialization error: {e}")
             raise
 
-    def process_image(self, image_path: str) -> Optional[Dict[str, Any]]:
-        """Process image using CoreML model"""
-        try:
-            logger.info(f"Processing image: {image_path}")
-
-            # Open and convert image to RGB
-            img = Image.open(image_path).convert('RGB')
-
-            # Resize image to 416x416 for YOLOv3
-            img = img.resize((416, 416))
-
-            # Make prediction using CoreML model with the correct input shape
-            prediction = self.model.predict({
-                'image': img
-            })
-            logger.info(f"Prediction successful: {prediction.keys()}")
-
-            return {
-                'file_path': image_path,
-                'prediction': prediction,
-                'vector': prediction.get('output', [])
-            }
-        except Exception as e:
-            logger.error(f"Error processing image {image_path}: {e}")
-            logger.error(f"Error details: {str(e)}")
-            return None
+    def create_embeddings(self, text: str) -> list:
+        """Create embeddings from text using SentenceTransformer"""
+        return self.embedder.encode(text).tolist()
 
     def index_media(self, directory: str):
         """Index all media files in the directory"""
@@ -91,61 +64,102 @@ class MediaIndexer:
         total_files = 0
         processed_files = 0
 
+        # Collect all image paths
+        image_paths = []
         for root, _, files in os.walk(directory):
-            total_files += len(files)
             for file in files:
-                file_path = os.path.join(root, file)
-
-                # Process only images
                 if file.lower().endswith(('.jpg', '.jpeg', '.png', '.gif')):
-                    result = self.process_image(file_path)
-                    if result:
+                    file_path = os.path.join(root, file)
+                    image_paths.append(file_path)
+                    total_files += 1
+
+        if not image_paths:
+            logger.warning(f"No images found in directory: {directory}")
+            return
+
+        # Process images in batches
+        batch_size = 32
+        for i in range(0, len(image_paths), batch_size):
+            batch_paths = image_paths[i:i + batch_size]
+            try:
+                # Process batch with YOLO
+                results = self.model(batch_paths, stream=True)
+
+                ids, documents, metadatas, embeddings = [], [], [], []
+
+                # Process each result in the batch
+                for file_path, result in zip(batch_paths, results):
+                    try:
+                        # Get detections
+                        detections = []
+                        objects = []
+                        if result.boxes:
+                            for box in result.boxes:
+                                cls = int(box.cls[0])
+                                conf = float(box.conf[0])
+                                class_name = result.names[cls]
+                                detections.append(f"{class_name}:{conf:.2f}")
+                                objects.append(class_name)
+
+                        # Create text description
+                        text_desc = ", ".join(
+                            objects) if objects else "no objects detected"
+
+                        # Convert detections list to string
+                        detections_str = "|".join(
+                            detections) if detections else "no detections"
+
+                        # Append to batch lists
+                        ids.append(file_path)
+                        documents.append(text_desc)
+                        metadatas.append({
+                            "path": file_path,
+                            "detections": detections_str,  # Store as string instead of list
+                            "object_count": len(objects)
+                        })
+                        embeddings.append(self.create_embeddings(text_desc))
+
                         processed_files += 1
-                        # Convert prediction vector to string for storage
-                        vector_str = ','.join(map(str, result['vector'])) if isinstance(
-                            result['vector'], (list, np.ndarray)) else str(result['vector'])
+                        if processed_files % 10 == 0:
+                            logger.info(
+                                f"Progress: {processed_files}/{total_files}")
 
-                        # Get tags from prediction if available
-                        tags = result.get('prediction', {}).get('labels', [])
-                        tags_str = ','.join(tags) if tags else ''
+                    except Exception as e:
+                        logger.error(f"Error processing {file_path}: {e}")
+                        continue
 
-                        # Combine tags and vector for document content
-                        document_content = f"tags:{tags_str}|vector:{vector_str}"
+                # Batch update ChromaDB
+                if ids:
+                    self.collection.upsert(
+                        ids=ids,
+                        embeddings=embeddings,
+                        documents=documents,
+                        metadatas=metadatas
+                    )
 
-                        # Update ChromaDB document
-                        self.collection.upsert(
-                            ids=[file_path],
-                            documents=[document_content],
-                            metadatas=[{
-                                'type': 'image',
-                                'prediction': str(result['prediction']),
-                                'file_path': file_path
-                            }]
-                        )
+            except Exception as e:
+                logger.error(f"Error processing batch: {e}")
+                continue
 
         logger.info(
-            f"Indexing complete. Processed {processed_files} out of {total_files} files")
+            f"Indexing complete. Processed {processed_files}/{total_files} files")
 
 
 def main():
     try:
-        # Get paths from environment variables
         model_path = os.getenv('MODEL_PATH')
         data_directory = os.getenv('DATA_DIRECTORY')
 
-        if not model_path or not data_directory:
-            logger.error(
-                "Please set MODEL_PATH and DATA_DIRECTORY environment variables")
+        if not data_directory:
+            logger.error("Please set DATA_DIRECTORY environment variable")
             return
 
         logger.info(f"Using model: {model_path}")
         logger.info(f"Scanning directory: {data_directory}")
 
-        # Initialize indexer with CoreML model
         indexer = MediaIndexer(model_path)
-
-        # Index media files
         indexer.index_media(data_directory)
+
     except Exception as e:
         logger.error(f"Error in main: {e}")
         raise

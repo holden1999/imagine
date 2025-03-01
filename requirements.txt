@@ -1,5 +1,6 @@
 torch
 torchvision
+ultralytics>=8.0.0
 chromadb
 psycopg2-binary
 pandas
@@ -9,3 +10,6 @@ Pillow
 moviepy
 coremltools
 transformers
+numpy
+python-dotenv
+sentence-transformers
