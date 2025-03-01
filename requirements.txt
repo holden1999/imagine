@@ -1,0 +1,11 @@
+torch
+torchvision
+chromadb
+psycopg2-binary
+pandas
+matplotlib
+seaborn
+Pillow
+moviepy
+coremltools
+transformers
