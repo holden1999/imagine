@@ -1,62 +1,91 @@
-import os
-import chromadb
-import logging
-from dotenv import load_dotenv
+from typing import List
+from PIL import Image
+from mlx_vlm.utils import load_config
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm import load, generate
 from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+import logging
+import chromadb
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables
 load_dotenv()
 
 
 class ImageRetriever:
     def __init__(self):
-        """Initialize ImageRetriever with ChromaDB and SentenceTransformer"""
+        """Initialize ImageRetriever with ChromaDB and SentenceTransformer optimized for Apple Silicon"""
+        model_path = "mlx-community/Qwen2.5-VL-7B-Instruct-8bit"
         try:
-            # Initialize ChromaDB
-            self.chroma_client = chromadb.HttpClient()
-            logger.info("ChromaDB client initialized")
 
-            # Get collection
+            # Initialize ChromaDB client
+            self.chroma_client = chromadb.HttpClient()
             self.collection = self.chroma_client.get_collection(
                 'media_vectors')
-            logger.info("Retrieved ChromaDB collection")
 
-            # Initialize SentenceTransformer
-            self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("SentenceTransformer loaded successfully")
+            # Initialize embedding model with CPU fallback
+            self.embedder = SentenceTransformer(
+                'all-MiniLM-L6-v2', device='cpu')
+
+            # Load MLX-optimized vision model with fast processor
+            self.model, self.processor = load(model_path, quantized=True)
+
+            self.config = load_config(model_path)
 
         except Exception as e:
             logger.error(f"Initialization error: {e}")
             raise
 
     def create_embeddings(self, text: str) -> list:
-        """Create embeddings from text using SentenceTransformer"""
+        """Generate text embeddings using CPU-based model"""
         return self.embedder.encode(text).tolist()
 
-    def query(self, text_query: str, n_results: int = 5) -> dict:
-        """Query the collection using text"""
+    def query(self, text_query: str, n_results: int = 1) -> dict:
+        """Query ChromaDB with Metal-accelerated embeddings"""
         try:
             logger.info(f"Querying with text: {text_query}")
             query_embedding = self.create_embeddings(text_query)
 
-            results = self.collection.query(
+            return self.collection.query(
                 query_embeddings=[query_embedding],
                 n_results=n_results
             )
-
-            logger.info(f"Found {len(results['ids'][0])} matches")
-            return results
 
         except Exception as e:
             logger.error(f"Query error: {e}")
             raise
 
+    def _process_image(self, img: str) -> str:
+        """Process image using proper preprocessing for Qwen VL model"""
+        try:
+            prompt = "Describe what you see in this image."
+            formatted_prompt = apply_chat_template(
+                self.processor,
+                self.config,
+                prompt,
+                num_images=1  # Process one image at a time
+            )
+            response = generate(
+                self.model,
+                self.processor,
+                formatted_prompt,
+                [img],  # Pass as single-item list
+                verbose=True
+            )
+            return response
+
+        except Exception as e:
+            logger.error(f"Image processing error: {e}")
+            return "Description unavailable"
+
     def display_results(self, results: dict):
-        """Display query results in a formatted way"""
+        """Display results using Metal-accelerated image processing"""
         try:
             if not results['ids'][0]:
                 logger.warning("No results found")
@@ -64,12 +93,27 @@ class ImageRetriever:
 
             print("\n=== Search Results ===")
             for i, (doc, meta) in enumerate(zip(results['documents'][0], results['metadatas'][0]), 1):
-                print(f"\nResult {i}:")
-                print(f"Description: {doc}")
-                print(f"File path: {meta['path']}")
-                print(f"Detections: {meta['detections']}")
-                print(f"Object count: {meta['object_count']}")
-                print("-" * 50)
+                try:
+                    print(f"\nResult {i}:")
+                    print(f"Description: {doc}")
+                    print(f"File path: {meta['path']}")
+
+                    # Display image and get AI description immediately
+                    with Image.open(meta['path']) as img:
+                        img.show()
+
+                    # Process single image
+                    ai_description = self._process_image(
+                        meta['path'])  # Pass as single-item list
+
+                    print(f"Detections: {meta['detections']}")
+                    print(f"Object count: {meta['object_count']}")
+                    print(f"AI Description: {ai_description}")
+                    print("-" * 50)
+
+                except Exception as e:
+                    logger.error(f"Error processing image {i}: {e}")
+                    continue
 
         except Exception as e:
             logger.error(f"Error displaying results: {e}")
@@ -78,15 +122,16 @@ class ImageRetriever:
 
 def main():
     try:
-        # Initialize retriever
         retriever = ImageRetriever()
 
-        # Example queries
         queries = [
-            "outdoor scene with trees and sky",
+            "outdoor scene with trees and sky"
         ]
 
-        # Process each query
+        # ,
+        # "indoor environment with modern furniture",
+        # "cityscape with tall buildings"
+
         for query in queries:
             print(f"\nSearching for: {query}")
             results = retriever.query(query)
