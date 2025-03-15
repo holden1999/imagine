@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 import logging
 import chromadb
 import os
+import requests
+import base64
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 
@@ -21,7 +23,6 @@ load_dotenv()
 class ImageRetriever:
     def __init__(self):
         """Initialize ImageRetriever with ChromaDB and SentenceTransformer optimized for Apple Silicon"""
-        model_path = "mlx-community/Qwen2.5-VL-7B-Instruct-8bit"
         try:
 
             # Initialize ChromaDB client
@@ -33,11 +34,6 @@ class ImageRetriever:
             self.embedder = SentenceTransformer(
                 'all-MiniLM-L6-v2', device='cpu')
 
-            # Load MLX-optimized vision model with fast processor
-            self.model, self.processor = load(model_path, quantized=True)
-
-            self.config = load_config(model_path)
-
         except Exception as e:
             logger.error(f"Initialization error: {e}")
             raise
@@ -46,7 +42,7 @@ class ImageRetriever:
         """Generate text embeddings using CPU-based model"""
         return self.embedder.encode(text).tolist()
 
-    def query(self, text_query: str, n_results: int = 1) -> dict:
+    def query(self, text_query: str, n_results: int = 5) -> dict:
         """Query ChromaDB with Metal-accelerated embeddings"""
         try:
             logger.info(f"Querying with text: {text_query}")
@@ -61,24 +57,45 @@ class ImageRetriever:
             logger.error(f"Query error: {e}")
             raise
 
-    def _process_image(self, img: str) -> str:
-        """Process image using proper preprocessing for Qwen VL model"""
+    def _process_image(self, img: str, detections: list) -> str:
+        """Process image using LM Studio API with detections"""
         try:
-            prompt = "Describe what you see in this image."
-            formatted_prompt = apply_chat_template(
-                self.processor,
-                self.config,
-                prompt,
-                num_images=1  # Process one image at a time
-            )
-            response = generate(
-                self.model,
-                self.processor,
-                formatted_prompt,
-                [img],  # Pass as single-item list
-                verbose=True
-            )
-            return response
+            with open(img, "rb") as image_file:
+                encoded_string = base64.b64encode(
+                    image_file.read()).decode('utf-8')
+
+            json_body = {
+                "model": "qwen2.5-vl-7b-instruct",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "What is this image?"
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{encoded_string}"
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": f"Detections: {detections}"
+                            }
+                        ]
+                    }
+                ],
+                "temperature": 0.7,
+                "max_tokens": -1,
+                "stream": False
+            }
+
+            response = requests.post(
+                "http://127.0.0.1:1234/v1/chat/completions", json=json_body)
+            response.raise_for_status()
+            return response.json().get("choices", [{}])[0].get("message", {}).get("content", "Description unavailable")
 
         except Exception as e:
             logger.error(f"Image processing error: {e}")
@@ -104,7 +121,7 @@ class ImageRetriever:
 
                     # Process single image
                     ai_description = self._process_image(
-                        meta['path'])  # Pass as single-item list
+                        meta['path'], meta['detections'])  # Pass as single-item list
 
                     print(f"Detections: {meta['detections']}")
                     print(f"Object count: {meta['object_count']}")
