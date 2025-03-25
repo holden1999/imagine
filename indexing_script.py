@@ -2,7 +2,8 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any
 import numpy as np
-import chromadb
+import psycopg2
+from psycopg2.extras import Json
 import logging
 from dotenv import load_dotenv
 import time
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class MediaIndexer:
     def __init__(self, model_path: str):
-        """Initialize the indexer with YOLO model, SentenceTransformer and ChromaDB"""
+        """Initialize the indexer with YOLO model, SentenceTransformer and pgvector"""
         try:
             # Initialize YOLO
             self.model = YOLO(model_path)
@@ -29,27 +30,16 @@ class MediaIndexer:
             self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
             logger.info("SentenceTransformer loaded successfully")
 
-            # Initialize ChromaDB
-            self.chroma_client = chromadb.HttpClient()
-            logger.info("ChromaDB client initialized")
-
-            # Create or get collection with retry
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    self.collection = self.chroma_client.get_or_create_collection(
-                        name='media_vectors'
-                    )
-                    logger.info(
-                        "ChromaDB collection created/accessed successfully")
-                    break
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        raise
-                    logger.warning(
-                        f"Attempt {attempt + 1} failed, retrying...")
-                    time.sleep(1)
-
+            # Initialize PostgreSQL connection
+            self.conn = psycopg2.connect(
+                host=os.getenv('POSTGRES_HOST'),
+                port=os.getenv('POSTGRES_PORT'),
+                user=os.getenv('POSTGRES_USER'),
+                password=os.getenv('POSTGRES_PASSWORD'),
+                dbname=os.getenv('POSTGRES_DB')
+            )
+            self.cursor = self.conn.cursor()
+            logger.info("PostgreSQL connection initialized")
         except Exception as e:
             logger.error(f"Initialization error: {e}")
             raise
@@ -58,91 +48,151 @@ class MediaIndexer:
         """Create embeddings from text using SentenceTransformer"""
         return self.embedder.encode(text).tolist()
 
+    def _is_valid_image(self, file_path: str) -> bool:
+        """Check if the image file is valid and readable"""
+        try:
+            from PIL import Image
+            with Image.open(file_path) as img:
+                img.verify()
+            return True
+        except Exception:
+            return False
+
     def index_media(self, directory: str):
         """Index all media files in the directory"""
-        logger.info(f"Starting media indexing in directory: {directory}")
-        total_files = 0
-        processed_files = 0
+        try:
+            # Clear terminal
+            os.system('clear' if os.name != 'nt' else 'cls')
+            logger.info(f"Starting media indexing in directory: {directory}")
 
-        # Collect all image paths
-        image_paths = []
-        for root, _, files in os.walk(directory):
-            for file in files:
-                if file.lower().endswith(('.jpg', '.jpeg', '.png', '.gif')):
-                    file_path = os.path.join(root, file)
-                    image_paths.append(file_path)
-                    total_files += 1
+            # Collect and validate image paths
+            image_paths = []
+            skipped_files = []
+            print("\nValidating images...")
+            for root, _, files in os.walk(directory):
+                for file in files:
+                    if file.lower().endswith(('.jpg', '.jpeg', '.png', '.gif')):
+                        file_path = os.path.join(root, file)
+                        if self._is_valid_image(file_path):
+                            image_paths.append(file_path)
+                        else:
+                            skipped_files.append(file_path)
+                            logger.warning(
+                                f"Skipping invalid image: {file_path}")
 
-        if not image_paths:
-            logger.warning(f"No images found in directory: {directory}")
-            return
+            if skipped_files:
+                print(f"\nSkipped {len(skipped_files)} invalid images")
 
-        # Process images in batches
-        batch_size = 32
-        for i in range(0, len(image_paths), batch_size):
-            batch_paths = image_paths[i:i + batch_size]
-            try:
-                # Process batch with YOLO
-                results = self.model(batch_paths, stream=True)
+            if not image_paths:
+                logger.warning(
+                    f"No valid images found in directory: {directory}")
+                return
 
-                ids, documents, metadatas, embeddings = [], [], [], []
+            total_files = len(image_paths)
+            total_batches = (total_files + 31) // 32
+            processed_files = 0
 
-                # Process each result in the batch
-                for file_path, result in zip(batch_paths, results):
-                    try:
-                        # Get detections
-                        detections = []
-                        objects = []
-                        if result.boxes:
-                            for box in result.boxes:
-                                cls = int(box.cls[0])
-                                conf = float(box.conf[0])
-                                class_name = result.names[cls]
-                                detections.append(f"{class_name}:{conf:.2f}")
-                                objects.append(class_name)
+            print(
+                f"\nFound {total_files} valid images to process in {total_batches} batches")
+            print("\nStarting batch processing...")
 
-                        # Create text description
-                        text_desc = ", ".join(
-                            objects) if objects else "no objects detected"
+            # Process images in batches
+            batch_size = 32
+            for batch_num, i in enumerate(range(0, total_files, batch_size), 1):
+                batch_paths = image_paths[i:i + batch_size]
+                current_batch_size = len(batch_paths)
 
-                        # Convert detections list to string
-                        detections_str = "|".join(
-                            detections) if detections else "no detections"
+                try:
+                    # Clear previous line and show current batch progress
+                    print(f"\033[K\rProcessing batch {batch_num}/{total_batches} "
+                          f"({current_batch_size} images)", end="", flush=True)
 
-                        # Append to batch lists
-                        ids.append(file_path)
-                        documents.append(text_desc)
-                        metadatas.append({
-                            "path": file_path,
-                            "detections": detections_str,  # Store as string instead of list
-                            "object_count": len(objects)
-                        })
-                        embeddings.append(self.create_embeddings(text_desc))
+                    # Process batch with YOLO
+                    results = self.model(batch_paths, stream=True)
+                    ids, documents, metadatas, embeddings = [], [], [], []
 
-                        processed_files += 1
-                        if processed_files % 10 == 0:
-                            logger.info(
-                                f"Progress: {processed_files}/{total_files}")
+                    # Process each result in the batch
+                    for file_path, result in zip(batch_paths, results):
+                        try:
+                            # Get detections
+                            detections = []
+                            objects = []
+                            if result.boxes:
+                                for box in result.boxes:
+                                    cls = int(box.cls[0])
+                                    conf = float(box.conf[0])
+                                    class_name = result.names[cls]
+                                    detections.append(
+                                        f"{class_name}:{conf:.2f}")
+                                    objects.append(class_name)
 
-                    except Exception as e:
-                        logger.error(f"Error processing {file_path}: {e}")
-                        continue
+                            # Create text description
+                            text_desc = ", ".join(
+                                objects) if objects else "no objects detected"
+                            detections_str = "|".join(
+                                detections) if detections else "no detections"
 
-                # Batch update ChromaDB
-                if ids:
-                    self.collection.upsert(
-                        ids=ids,
-                        embeddings=embeddings,
-                        documents=documents,
-                        metadatas=metadatas
-                    )
+                            # Append to batch lists
+                            ids.append(file_path)
+                            documents.append(text_desc)
+                            metadatas.append({
+                                "path": file_path,
+                                "detections": detections_str,
+                                "object_count": len(objects)
+                            })
+                            embeddings.append(
+                                self.create_embeddings(text_desc))
+                            processed_files += 1
 
-            except Exception as e:
-                logger.error(f"Error processing batch: {e}")
-                continue
+                        except Exception as e:
+                            logger.error(
+                                f"Error processing single image {file_path}: {e}")
+                            continue
 
-        logger.info(
-            f"Indexing complete. Processed {processed_files}/{total_files} files")
+                    # Batch update PostgreSQL with progress indicator
+                    if ids:
+                        print(f"\033[K\rUploading batch {batch_num}/{total_batches} to PostgreSQL...",
+                              end="", flush=True)
+                        try:
+                            # Start a new transaction
+                            self.conn.rollback()  # Reset any failed transaction
+
+                            insert_query = """
+                                INSERT INTO media_vectors (path, metadata, embedding)
+                                VALUES %s
+                                ON CONFLICT (path) DO UPDATE SET
+                                    metadata = EXCLUDED.metadata,
+                                    embedding = EXCLUDED.embedding
+                            """
+                            psycopg2.extras.execute_values(
+                                self.cursor, insert_query,
+                                [(metadata['path'], Json(metadata), embedding)
+                                 for metadata, embedding in zip(metadatas, embeddings)]
+                            )
+
+                            # Commit the successful inserts
+                            self.conn.commit()
+                            print(f"\033[K\rCompleted batch {batch_num}/{total_batches} "
+                                  f"({processed_files}/{total_files} files processed)")
+
+                        except Exception as e:
+                            logger.error(
+                                f"Error processing batch {batch_num}: {e}")
+                            self.conn.rollback()  # Rollback failed transaction
+                            continue
+
+                except Exception as e:
+                    logger.error(f"Error processing batch {batch_num}: {e}")
+                    continue
+
+            print(
+                f"\nIndexing complete. Successfully processed {processed_files}/{total_files} files")
+            if skipped_files:
+                print(f"Skipped {len(skipped_files)} invalid files")
+
+        except Exception as e:
+            logger.error(f"Error during indexing: {e}")
+            raise
 
 
 def main():
