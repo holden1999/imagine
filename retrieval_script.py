@@ -48,14 +48,13 @@ class ImageRetriever:
         """Generate text embeddings using CPU-based model"""
         return self.embedder.encode(text).tolist()
 
-    def query(self, text_query: str, n_results: int = 10) -> dict:
+    def query(self, text_query: str, n_results: int = 5) -> dict:
         """Query PostgreSQL with Metal-accelerated embeddings"""
         try:
             query_embedding = self.create_embeddings(text_query)
             self.cursor.execute("""
                 SELECT path, metadata ->> 'detections', embedding <-> (%s::vector) AS distance
                 FROM media_vectors
-                where metadata ->>'detections' is null
                 ORDER BY distance
                 LIMIT %s
             """, (query_embedding, n_results))
@@ -180,6 +179,11 @@ Reformat response as:
 
                     unmarshall = json.loads(ai_description)
 
+                    print(
+                        f"Updated Description: {unmarshall['result'][0]['detection']}")
+                    print(
+                        f"Updated Metadata: {unmarshall['result'][0]['metadata']}")
+
                     # Upsert with AI description as document
                     self.cursor.execute("""
                         UPDATE media_vectors
@@ -187,11 +191,6 @@ Reformat response as:
                         WHERE path = %s
                     """, (unmarshall['result'][0]['metadata'], self.create_embeddings(unmarshall['result'][0]['detection']), meta['path']))
                     self.conn.commit()
-
-                    print(
-                        f"Updated Description: {unmarshall['result'][0]['detection']}")
-                    print(
-                        f"Updated Metadata: {unmarshall['result'][0]['metadata']}")
 
                     print("-" * 50)
 
