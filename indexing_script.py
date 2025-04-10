@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 import time
 from ultralytics import YOLO
 from sentence_transformers import SentenceTransformer
+from config import config
 
 # Load environment variables
 load_dotenv()
@@ -30,16 +31,12 @@ class MediaIndexer:
             self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
             logger.info("SentenceTransformer loaded successfully")
 
-            # Initialize PostgreSQL connection
-            self.conn = psycopg2.connect(
-                host=os.getenv('POSTGRES_HOST'),
-                port=os.getenv('POSTGRES_PORT'),
-                user=os.getenv('POSTGRES_USER'),
-                password=os.getenv('POSTGRES_PASSWORD'),
-                dbname=os.getenv('POSTGRES_DB')
-            )
+            # Initialize PostgreSQL connection using config
+            db_config = config()
+            self.conn = psycopg2.connect(**db_config)
             self.cursor = self.conn.cursor()
             logger.info("PostgreSQL connection initialized")
+
         except Exception as e:
             logger.error(f"Initialization error: {e}")
             raise
