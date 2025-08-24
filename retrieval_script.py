@@ -5,6 +5,11 @@ from psycopg2.extras import Json
 from dotenv import load_dotenv
 from config import config
 from transformers import BartTokenizer, BartModel
+from PIL import Image
+import pillow_heif  # Add this import
+
+# Register HEIF opener for PIL
+pillow_heif.register_heif_opener()
 
 # Load environment variables
 load_dotenv()
@@ -38,7 +43,7 @@ class ImageRetriever:
         embedding = last_hidden_states.mean(dim=1).squeeze().tolist()
         return embedding
 
-    def query(self, text_query: str, n_results: int = 10):
+    def query(self, text_query: str, n_results: int = 5):
         try:
             # Generate embedding for the query using BART
             query_embedding = self.get_bart_embedding(text_query)
@@ -72,12 +77,18 @@ class ImageRetriever:
             print(f"Caption: {result['caption']}")
             print(f"Distance: {result['distance']:.4f}")
             print("-" * 40)
+            # Preview image using PIL
+            try:
+                img = Image.open(result['path'])
+                img.show(title=os.path.basename(result['path']))
+            except Exception as e:
+                print(f"Could not preview image: {e}")
 
 
 def main():
     retriever = ImageRetriever()
     queries = [
-        "bikini",
+        "yoga",
     ]
     for query in queries:
         print(f"\nSearching for: {query}")

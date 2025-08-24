@@ -23,7 +23,7 @@ class MediaIndexer:
             self.processor = BlipProcessor.from_pretrained(
                 "Salesforce/blip-image-captioning-large")
             self.model = BlipForConditionalGeneration.from_pretrained(
-                "Salesforce/blip-image-captioning-large")
+                "Salesforce/blip-image-captioning-large").to("mps")
             logger.info("BLIP model and processor loaded successfully")
 
             # Initialize BART tokenizer and model
@@ -83,7 +83,8 @@ class MediaIndexer:
                 try:
                     # Open and process the image
                     raw_image = Image.open(img_path).convert('RGB')
-                    inputs = self.processor(raw_image, return_tensors="pt")
+                    inputs = self.processor(
+                        raw_image, return_tensors="pt").to("mps")
                     out = self.model.generate(**inputs)
                     caption = self.processor.decode(
                         out[0], skip_special_tokens=True)
