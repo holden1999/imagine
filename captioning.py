@@ -9,9 +9,9 @@ load_dotenv()
 data_directory = os.getenv('DATA_DIRECTORY')
 
 processor = BlipProcessor.from_pretrained(
-    "Salesforce/blip-image-captioning-base")
+    "Salesforce/blip-image-captioning-large")
 model = BlipForConditionalGeneration.from_pretrained(
-    "Salesforce/blip-image-captioning-base")
+    "Salesforce/blip-image-captioning-large")
 
 # List all image files in the data directory
 image_files = [

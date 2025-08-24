@@ -1,14 +1,10 @@
 import os
-from pathlib import Path
-from typing import Optional, Dict, Any
-import numpy as np
+from dotenv import load_dotenv
+from PIL import Image
 import psycopg2
 from psycopg2.extras import Json
 import logging
-from dotenv import load_dotenv
-import time
-from ultralytics import YOLO
-from sentence_transformers import SentenceTransformer
+from transformers import BlipProcessor, BlipForConditionalGeneration, BartTokenizer, BartModel
 from config import config
 
 # Load environment variables
@@ -20,16 +16,22 @@ logger = logging.getLogger(__name__)
 
 
 class MediaIndexer:
-    def __init__(self, model_path: str):
-        """Initialize the indexer with YOLO model, SentenceTransformer and pgvector"""
+    def __init__(self):
+        """Initialize the indexer with BLIP processor, model, feature extractor, and PostgreSQL connection"""
         try:
-            # Initialize YOLO
-            self.model = YOLO(model_path)
-            logger.info("YOLO model loaded successfully")
+            # Initialize BLIP processor and model
+            self.processor = BlipProcessor.from_pretrained(
+                "Salesforce/blip-image-captioning-large")
+            self.model = BlipForConditionalGeneration.from_pretrained(
+                "Salesforce/blip-image-captioning-large")
+            logger.info("BLIP model and processor loaded successfully")
 
-            # Initialize SentenceTransformer
-            self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
-            logger.info("SentenceTransformer loaded successfully")
+            # Initialize BART tokenizer and model
+            self.bart_tokenizer = BartTokenizer.from_pretrained(
+                'facebook/bart-base')
+            self.bart_model = BartModel.from_pretrained('facebook/bart-base')
+            logger.info(
+                "facebook/bart-base tokenizer and model loaded for feature extraction")
 
             # Initialize PostgreSQL connection using config
             db_config = config()
@@ -41,151 +43,77 @@ class MediaIndexer:
             logger.error(f"Initialization error: {e}")
             raise
 
-    def create_embeddings(self, text: str) -> list:
-        """Create embeddings from text using SentenceTransformer"""
-        return self.embedder.encode(text).tolist()
+    def get_bart_embedding(self, text: str):
+        """Extract embedding for the given text using BART model"""
+        inputs = self.bart_tokenizer(text, return_tensors="pt")
+        outputs = self.bart_model(**inputs)
+        last_hidden_states = outputs.last_hidden_state
+        embedding = last_hidden_states.mean(dim=1).squeeze().tolist()
+        return embedding
 
-    def _is_valid_image(self, file_path: str) -> bool:
-        """Check if the image file is valid and readable"""
-        try:
-            from PIL import Image
-            with Image.open(file_path) as img:
-                img.verify()
-            return True
-        except Exception:
-            return False
-
-    def index_media(self, directory: str):
-        """Index all media files in the directory"""
+    def index_images_with_captions(self, directory: str):
+        """Index all images in the directory and store captions in the database"""
         try:
             # Clear terminal
             os.system('clear' if os.name != 'nt' else 'cls')
-            logger.info(f"Starting media indexing in directory: {directory}")
+            logger.info(f"Starting image indexing in directory: {directory}")
 
-            # Collect and validate image paths
-            image_paths = []
-            skipped_files = []
-            print("\nValidating images...")
-            for root, _, files in os.walk(directory):
-                for file in files:
-                    if file.lower().endswith(('.jpg', '.jpeg', '.png', '.gif')):
-                        file_path = os.path.join(root, file)
-                        if self._is_valid_image(file_path):
-                            image_paths.append(file_path)
-                        else:
-                            skipped_files.append(file_path)
-                            logger.warning(
-                                f"Skipping invalid image: {file_path}")
+            # Collect image paths
+            image_files = [
+                os.path.join(root, file)
+                for root, _, files in os.walk(directory)
+                for file in files
+                if file.lower().endswith((".jpg", ".jpeg", ".png", ".gif"))
+            ]
 
-            if skipped_files:
-                print(f"\nSkipped {len(skipped_files)} invalid images")
-
-            if not image_paths:
+            if not image_files:
                 logger.warning(
                     f"No valid images found in directory: {directory}")
                 return
 
-            total_files = len(image_paths)
-            total_batches = (total_files + 31) // 32
+            total_files = len(image_files)
             processed_files = 0
 
             print(
-                f"\nFound {total_files} valid images to process in {total_batches} batches")
-            print("\nStarting batch processing...")
+                f"\nFound {total_files} images to process")
+            print("\nStarting processing...")
 
-            # Process images in batches
-            batch_size = 32
-            for batch_num, i in enumerate(range(0, total_files, batch_size), 1):
-                batch_paths = image_paths[i:i + batch_size]
-                current_batch_size = len(batch_paths)
-
+            # Process each image file
+            for img_path in image_files:
                 try:
-                    # Clear previous line and show current batch progress
-                    print(f"\033[K\rProcessing batch {batch_num}/{total_batches} "
-                          f"({current_batch_size} images)", end="", flush=True)
+                    # Open and process the image
+                    raw_image = Image.open(img_path).convert('RGB')
+                    inputs = self.processor(raw_image, return_tensors="pt")
+                    out = self.model.generate(**inputs)
+                    caption = self.processor.decode(
+                        out[0], skip_special_tokens=True)
 
-                    # Process batch with YOLO
-                    results = self.model(batch_paths, stream=True)
-                    ids, documents, metadatas, embeddings = [], [], [], []
+                    # Feature extraction for embedding using BART
+                    embedding = self.get_bart_embedding(caption)
 
-                    # Process each result in the batch
-                    for file_path, result in zip(batch_paths, results):
-                        try:
-                            # Get detections
-                            detections = []
-                            objects = []
-                            if result.boxes:
-                                for box in result.boxes:
-                                    cls = int(box.cls[0])
-                                    conf = float(box.conf[0])
-                                    class_name = result.names[cls]
-                                    detections.append(
-                                        f"{class_name}:{conf:.2f}")
-                                    objects.append(class_name)
+                    # Prepare metadata
+                    metadata = {"path": img_path, "caption": caption}
 
-                            # Create text description
-                            text_desc = ", ".join(
-                                objects) if objects else "no objects detected"
-                            detections_str = "|".join(
-                                detections) if detections else "no detections"
-
-                            # Append to batch lists
-                            ids.append(file_path)
-                            documents.append(text_desc)
-                            metadatas.append({
-                                "path": file_path,
-                                "detections": detections_str,
-                                "object_count": len(objects)
-                            })
-                            embeddings.append(
-                                self.create_embeddings(text_desc))
-                            processed_files += 1
-
-                        except Exception as e:
-                            logger.error(
-                                f"Error processing single image {file_path}: {e}")
-                            continue
-
-                    # Batch update PostgreSQL with progress indicator
-                    if ids:
-                        print(f"\033[K\rUploading batch {batch_num}/{total_batches} to PostgreSQL...",
-                              end="", flush=True)
-                        try:
-                            # Start a new transaction
-                            self.conn.rollback()  # Reset any failed transaction
-
-                            insert_query = """
-                                INSERT INTO media_vectors (path, metadata, embedding)
-                                VALUES %s
-                                ON CONFLICT (path) DO UPDATE SET
-                                    metadata = EXCLUDED.metadata,
-                                    embedding = EXCLUDED.embedding
-                            """
-                            psycopg2.extras.execute_values(
-                                self.cursor, insert_query,
-                                [(metadata['path'], Json(metadata), embedding)
-                                 for metadata, embedding in zip(metadatas, embeddings)]
-                            )
-
-                            # Commit the successful inserts
-                            self.conn.commit()
-                            print(f"\033[K\rCompleted batch {batch_num}/{total_batches} "
-                                  f"({processed_files}/{total_files} files processed)")
-
-                        except Exception as e:
-                            logger.error(
-                                f"Error processing batch {batch_num}: {e}")
-                            self.conn.rollback()  # Rollback failed transaction
-                            continue
+                    # Insert or update in PostgreSQL
+                    self.cursor.execute(
+                        """
+                        INSERT INTO media_vectors (path, metadata, embedding)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (path) DO UPDATE SET metadata = EXCLUDED.metadata, embedding = EXCLUDED.embedding
+                        """,
+                        (img_path, Json(metadata), embedding)
+                    )
+                    self.conn.commit()
+                    processed_files += 1
+                    print(
+                        f"Indexed: {os.path.basename(img_path)} | Caption: {caption}")
 
                 except Exception as e:
-                    logger.error(f"Error processing batch {batch_num}: {e}")
+                    logger.error(f"Error processing {img_path}: {e}")
                     continue
 
             print(
                 f"\nIndexing complete. Successfully processed {processed_files}/{total_files} files")
-            if skipped_files:
-                print(f"Skipped {len(skipped_files)} invalid files")
 
         except Exception as e:
             logger.error(f"Error during indexing: {e}")
@@ -194,18 +122,16 @@ class MediaIndexer:
 
 def main():
     try:
-        model_path = os.getenv('MODEL_PATH')
         data_directory = os.getenv('DATA_DIRECTORY')
 
         if not data_directory:
             logger.error("Please set DATA_DIRECTORY environment variable")
             return
 
-        logger.info(f"Using model: {model_path}")
         logger.info(f"Scanning directory: {data_directory}")
 
-        indexer = MediaIndexer(model_path)
-        indexer.index_media(data_directory)
+        indexer = MediaIndexer()
+        indexer.index_images_with_captions(data_directory)
 
     except Exception as e:
         logger.error(f"Error in main: {e}")
