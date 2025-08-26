@@ -4,7 +4,7 @@ from PIL import Image
 import psycopg2
 from psycopg2.extras import Json
 import logging
-from transformers import BlipProcessor, BlipForConditionalGeneration, BartTokenizer, BartModel
+from transformers import BlipProcessor, BlipForConditionalGeneration, AutoTokenizer, AutoModel
 from config import config
 
 # Load environment variables
@@ -27,11 +27,12 @@ class MediaIndexer:
             logger.info("BLIP model and processor loaded successfully")
 
             # Initialize BART tokenizer and model
-            self.bart_tokenizer = BartTokenizer.from_pretrained(
-                'facebook/bart-base')
-            self.bart_model = BartModel.from_pretrained('facebook/bart-base')
+            self.bart_tokenizer = AutoTokenizer.from_pretrained(
+                'sentence-transformers/all-mpnet-base-v2')
+            self.bart_model = AutoModel.from_pretrained(
+                'sentence-transformers/all-mpnet-base-v2')
             logger.info(
-                "facebook/bart-base tokenizer and model loaded for feature extraction")
+                "sentence-transformers/all-mpnet-base-v2 tokenizer and model loaded for feature extraction")
 
             # Initialize PostgreSQL connection using config
             db_config = config()
